@@ -51,7 +51,8 @@ This has seen quite some development over quite some time locally, the GitHub re
   Include `status=allocated` and `status=assigned` *(default)*.
 - `-c`, `--custom LIST`  
   Add custom IP/CIDR entries. May be used multiple times.  
-  LIST may be a single entry or a list split by comma/semicolon/space.  
+  LIST may be a single entry, a list split by comma/semicolon/space,  
+  or a path to a plaintext file containing one entry per line.  
   Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).  
   Also supports `-c=...`, `--custom=...`
 - `-h`, `--help`  
@@ -92,6 +93,11 @@ This has seen quite some development over quite some time locally, the GitHub re
 ./CIDRnt NZ -c 203.0.113.7
 ./CIDRnt --locale NZ --custom "203.0.113.0/24,2001:db8::/32"
 ./CIDRnt -c=198.51.100.10 --custom=2001:db8::1 NZ
+
+# Custom entries from a file (one IP/CIDR per line)
+./CIDRnt --custom ./custom-list.txt NZ
+./CIDRnt -c=./custom-list.txt NZ
+./CIDRnt --custom=./custom-list.txt NZ
 
 # Mixed positional + locale flags
 ./CIDRnt NZ --locale AU -l JP

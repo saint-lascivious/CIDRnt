@@ -17,7 +17,7 @@ STATUS_MODE="allocated-and-assigned"
 MINIMISE_IPV6=0
 OUTPUT_FILE=""
 TMPDIR="${TMPDIR:-/tmp}/cidrnt.$$"
-VERSION=0.1.0
+VERSION=0.2.0
 
 cleanup() {
 
@@ -70,7 +70,8 @@ Options:
       Include status=allocated and status=assigned (default).
   -c, --custom LIST
       Add custom IP/CIDR entries. May be used multiple times.
-      LIST may be a single entry or a list split by comma/semicolon/space.
+      LIST may be a single entry, a list split by comma/semicolon/space,
+      or a path to a plaintext file containing one entry per line.
       Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).
       Also supports -c=..., --custom=...
   -h, --help
@@ -1234,6 +1235,28 @@ prepare_custom_cidrs() {
 
     [ -s "$CUSTOM_ARGS_FILE" ] || return 0
 
+    CUSTOM_EXPANDED_ARGS_FILE="$TMPDIR/custom.args.expanded"
+    : > "$CUSTOM_EXPANDED_ARGS_FILE"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+
+        [ -n "$line" ] || continue
+
+        if [ -f "$line" ] && [ -r "$line" ]; then
+
+            while IFS= read -r entry || [ -n "$entry" ]; do
+
+                [ -n "$entry" ] || continue
+
+                printf '%s\n' "$entry" >> "$CUSTOM_EXPANDED_ARGS_FILE"
+            done < "$line"
+
+        else
+            printf '%s\n' "$line" >> "$CUSTOM_EXPANDED_ARGS_FILE"
+        fi
+
+    done < "$CUSTOM_ARGS_FILE"
+
     awk '
         function is_h16(x) { return (x ~ /^[0-9a-f]{1,4}$/) }
 
@@ -1362,7 +1385,7 @@ prepare_custom_cidrs() {
             if (err) exit 1
 
         }
-    ' "$CUSTOM_ARGS_FILE" > "$TMPDIR/custom.cidrs.tmp" || die "failed parsing custom IP/CIDR input"
+    ' "$CUSTOM_EXPANDED_ARGS_FILE" > "$TMPDIR/custom.cidrs.tmp" || die "failed parsing custom IP/CIDR input"
 
     awk '!seen[$0]++' "$TMPDIR/custom.cidrs.tmp" > "$CUSTOM_CIDRS_FILE"
 
@@ -1390,6 +1413,8 @@ self_test() {
     }
 
     self_test_reset_parse_state() {
+        CUSTOM_ARGS_FILE=""
+        CUSTOM_CIDRS_FILE=""
         FAMILY_MODE="all"
         MINIMISE_IPV6=0
         OUTPUT_FILE=""
@@ -1525,6 +1550,27 @@ EOF
         "$TMPDIR/parse_args_custom_options.want" \
         "$CUSTOM_ARGS_FILE" || fail=1
 
+    cat > "$TMPDIR/custom-file-list.txt" <<'EOF'
+2001:db8::/32
+203.0.113.7
+EOF
+
+    self_test_reset_parse_state
+
+    parse_args -c "$TMPDIR/custom-file-list.txt" NZ
+
+    prepare_custom_cidrs
+
+    cat > "$TMPDIR/prepare_custom_cidrs_file.want" <<'EOF'
+2001:db8::/32
+203.0.113.7/32
+EOF
+
+    self_test_diff \
+        "custom file input" \
+        "$TMPDIR/prepare_custom_cidrs_file.want" \
+        "$CUSTOM_CIDRS_FILE" || fail=1
+
     self_test_assert_usage "option parsing (-h)" -h
 
     self_test_assert_usage "option parsing (--help)" --help
@@ -1654,6 +1700,8 @@ EOF
     fi
 
     self_test_section "status and family filters"
+
+    self_test_reset_parse_state
 
     cat > "$TMPDIR/delegated" <<'EOF'
 apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
