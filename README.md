@@ -50,10 +50,10 @@ This has seen quite some development over quite some time locally, the GitHub re
 - `-A`, `--allocated-and-assigned`  
   Include `status=allocated` and `status=assigned` *(default)*.
 - `-c`, `--custom LIST`  
-  Add custom IP/CIDR entries. May be used multiple times.
-  LIST may be a single entry or a list split by comma/semicolon/space.
-  Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).
-  Also supports -c=..., --custom=...
+  Add custom IP/CIDR entries. May be used multiple times.  
+  LIST may be a single entry or a list split by comma/semicolon/space.  
+  Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).  
+  Also supports `-c=...`, `--custom=...`  
 - `-h`, `--help`  
   Show help and exit.
 - `-i`, `--ipv4-only`  
