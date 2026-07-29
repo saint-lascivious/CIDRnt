@@ -1,0 +1,1929 @@
+#!/bin/sh
+
+# CIDRnt - Generate geographic CIDR lists from APNIC delegated stats.
+
+set -eu
+
+APNIC_URL="https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-/tmp/.cache}}/cidrnt"
+CACHE_FILE="$CACHE_DIR/delegated-apnic-latest"
+CACHE_STAMP="$CACHE_DIR/delegated-apnic-latest.epoch"
+CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-86400}"
+CUSTOM_ARGS_FILE=""
+CUSTOM_CIDRS_FILE=""
+FAMILY_MODE="all"
+RUN_SELF_TEST=0
+STATUS_MODE="allocated-and-assigned"
+MINIMISE_IPV6=0
+OUTPUT_FILE=""
+TMPDIR="${TMPDIR:-/tmp}/cidrnt.$$"
+VERSION=0.0.1
+
+cleanup() {
+
+    rm -fr "$TMPDIR"
+
+}
+
+on_abort() {
+
+    sig=$1
+
+    if [ -t 1 ]; then
+        printf '%s\n' "CIDRnt aborted ($sig)"
+    fi
+
+    case "$sig" in
+        INT)
+            exit 130
+            ;;
+        TERM)
+            exit 143
+            ;;
+        HUP)
+            exit 129
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+
+}
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+usage_text() {
+
+    cat <<EOF
+CIDRnt - Generate geographic CIDR lists from APNIC delegated stats.
+
+Usage:
+  ./CIDRnt [options] [LOCALE ...]
+
+Options:
+  -a, --allocated-only
+      Include only status=allocated.
+  -A, --allocated-and-assigned
+      Include status=allocated and status=assigned (default).
+  -c, --custom LIST
+      Add custom IP/CIDR entries. May be used multiple times.
+      LIST may be a single entry or a list split by comma/semicolon/space.
+      Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).
+      Also supports -c=..., --custom=...
+  -h, --help
+      Show help and exit.
+  -i, --ipv4-only
+      Include only IPv4 CIDRs.
+  -I, --ipv6-only
+      Include only IPv6 CIDRs.
+  -l, --locale LOCALE
+      Add locale(s) to include. May be used multiple times.
+      LOCALE may be a single code (NZ) or a list (NZ,AU;JP).
+      Also supports -l=..., --locale=..., --locales=...
+  -m, --minimise-ipv6
+      Minimise IPv6 formatting in output (RFC5952-style compression).
+  -o, --output FILE
+      Write output to file instead of stdout, use - for stdout.
+  -s, --self-test
+      Perform local tests and exit.
+  -v, --version
+      Show version and exit.
+
+Examples:
+  # Default locale (NZ)
+  ./CIDRnt
+
+  # Positional locales
+  ./CIDRnt NZ
+  ./CIDRnt NZ AU
+  ./CIDRnt "NZ,AU,JP"
+
+  # Locale flags (-l/--locale, repeated or list)
+  ./CIDRnt -l NZ -l AU -l JP
+  ./CIDRnt --locale=NZ,AU,JP
+
+  # Custom entries (merged before final aggregation/sort)
+  ./CIDRnt NZ -c 203.0.113.7
+  ./CIDRnt --locale NZ --custom "203.0.113.0/24,2001:db8::/32"
+  ./CIDRnt -c=198.51.100.10 --custom=2001:db8::1 NZ
+
+  # Mixed positional + locale flags
+  ./CIDRnt NZ --locale AU -l JP
+
+  # Status/family filters
+  ./CIDRnt --allocated-only NZ AU
+  ./CIDRnt --ipv4-only --locale NZ --locale AU
+  ./CIDRnt --ipv6-only -l NZ -l AU
+
+  # IPv6 output minimisation
+  ./CIDRnt --minimise-ipv6 NZ
+
+  # Write output
+  ./CIDRnt -o ./out/nz.txt NZ
+  ./CIDRnt --output ./out/nz-au.txt NZ AU
+  ./CIDRnt --output=./out/nz-au-jp.txt --locale=NZ,AU,JP
+
+  # Force stdout explicitly
+  ./CIDRnt --output=- NZ
+
+License:
+- GNU General Public License v3.0 or later (GPL-3.0+)
+
+Notes:
+- Output is plaintext CIDR notation (IPv4/IPv6), one per line.
+- Temporary files created under $TMPDIR; cleaned on exit.
+- APNIC data is cached at: $CACHE_FILE
+- Cache TTL is controlled by CACHE_TTL_SECONDS (default: 86400).
+  Set CACHE_TTL_SECONDS=0 to disable cache reuse.
+EOF
+
+}
+
+get_terminal_rows() {
+
+    rows=""
+
+    if [ -t 1 ] && need_cmd tput && [ -n "${TERM:-}" ]; then
+        rows=$(tput lines 2>/dev/null || printf '')
+    fi
+
+    if [ -z "$rows" ] && [ -t 1 ] && need_cmd stty; then
+        rows=$(stty size 2>/dev/null | awk '{print $1}')
+    fi
+
+    case "$rows" in
+        ''|*[!0-9]*)
+            rows=0
+            ;;
+    esac
+
+    printf '%s\n' "$rows"
+
+}
+
+choose_pager() {
+
+    if [ -n "${PAGER:-}" ]; then
+        # shellcheck disable=SC2086
+        set -- $PAGER
+
+        if [ "$#" -gt 0 ] && need_cmd "$1"; then
+            printf '%s\n' "$PAGER"
+            return 0
+        fi
+
+    fi
+
+    if need_cmd less; then
+        printf '%s\n' "less"
+        return 0
+    fi
+
+    if need_cmd more; then
+        printf '%s\n' "more"
+        return 0
+    fi
+
+    return 1
+
+}
+
+usage() {
+
+    if [ ! -t 1 ]; then
+
+        usage_text
+
+        return
+    fi
+
+    lines=$(usage_text | awk 'END { print NR + 0 }')
+    rows=$(get_terminal_rows)
+
+    if [ "$rows" -gt 0 ] && [ "$lines" -gt "$rows" ]; then
+        pager_cmd=$(choose_pager || printf '')
+
+        if [ -n "$pager_cmd" ]; then
+
+            usage_text | sh -c "$pager_cmd"
+
+            return
+        fi
+
+    fi
+
+    usage_text
+
+}
+
+trap cleanup EXIT
+trap 'on_abort INT' INT
+trap 'on_abort TERM' TERM
+trap 'on_abort HUP' HUP
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+parse_locales() {
+
+    if [ "$#" -eq 0 ]; then
+        set -- NZ
+    fi
+
+    LOCALES_FILE="$TMPDIR/locales"
+    : > "$LOCALES_FILE"
+
+    for arg in "$@"; do
+
+        for cc in $(printf '%s\n' "$arg" | tr ',;' '  '); do
+            cc="$(printf '%s' "$cc" | tr '[:lower:]' '[:upper:]')"
+
+            [ -n "$cc" ] || continue
+
+            case "$cc" in
+                [A-Z][A-Z])
+                    ;;
+                *)
+
+                    die "invalid locale code: $cc (expected ISO-3166 alpha-2)"
+
+                    ;;
+            esac
+
+            printf '%s\n' "$cc" >> "$LOCALES_FILE"
+        done
+
+    done
+
+    awk '!seen[$0]++' "$LOCALES_FILE" > "$LOCALES_FILE.tmp"
+
+    mv "$LOCALES_FILE.tmp" "$LOCALES_FILE"
+
+    [ -s "$LOCALES_FILE" ] || die "no valid locales supplied"
+
+}
+
+can_use_cached_apnic() {
+
+    case "$CACHE_TTL_SECONDS" in
+        ''|*[!0-9]*)
+            die "CACHE_TTL_SECONDS must be a non-negative integer"
+            ;;
+    esac
+
+    [ "$CACHE_TTL_SECONDS" -gt 0 ] || return 1
+
+    [ -s "$CACHE_FILE" ] || return 1
+
+    [ -s "$CACHE_STAMP" ] || return 1
+
+    now=$(date +%s 2>/dev/null || printf '0')
+    fetched=$(cat "$CACHE_STAMP" 2>/dev/null || printf '0')
+
+    case "$now" in ''|*[!0-9]*)
+        return 1
+        ;;
+    esac
+
+    case "$fetched" in ''|*[!0-9]*)
+        return 1
+        ;;
+    esac
+
+    age=$((now - fetched))
+
+    [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_TTL_SECONDS" ]
+
+}
+
+fetch_apnic() {
+
+    mkdir -p "$TMPDIR" "$CACHE_DIR"
+
+    if can_use_cached_apnic; then
+
+        cp "$CACHE_FILE" "$TMPDIR/delegated"
+
+        return
+    fi
+
+    if need_cmd curl; then
+
+        curl -fsSL "$APNIC_URL" > "$TMPDIR/delegated" || {
+
+            if [ -s "$CACHE_FILE" ]; then
+                printf '%s\n' "warning: APNIC download failed, using cached data" >&2
+
+                cp "$CACHE_FILE" "$TMPDIR/delegated"
+
+                return
+            fi
+
+            die "failed fetching APNIC data with curl"
+
+        }
+
+    elif need_cmd wget; then
+
+        wget -q -O "$TMPDIR/delegated" "$APNIC_URL" || {
+
+            if [ -s "$CACHE_FILE" ]; then
+                printf '%s\n' "warning: APNIC download failed, using cached data" >&2
+
+                cp "$CACHE_FILE" "$TMPDIR/delegated"
+
+                return
+            fi
+
+            die "failed fetching APNIC data with wget"
+
+        }
+
+    else
+
+        die "either curl or wget is required"
+
+    fi
+
+    cp "$TMPDIR/delegated" "$CACHE_FILE"
+
+    date +%s > "$CACHE_STAMP" 2>/dev/null || printf '0\n' > "$CACHE_STAMP"
+
+}
+
+extract_cidrs() {
+
+    awk -F'|' -v lf="$LOCALES_FILE" -v status_mode="$STATUS_MODE" -v family_mode="$FAMILY_MODE" '
+        BEGIN {
+
+            while ((getline c < lf) > 0) cc[c] = 1
+
+            close(lf)
+        }
+
+        function ipv4_to_int(ip, a, i, o, n) {
+            split(ip, a, ".")
+
+            if (length(a) != 4) return -1
+
+            n = 0
+
+            for (i = 1; i <= 4; i++) {
+                o = a[i]
+
+                if (o !~ /^[0-9]+$/) return -1
+
+                o += 0
+
+                if (o < 0 || o > 255) return -1
+
+                n = n * 256 + o
+            }
+
+            return n
+        }
+
+        function int_to_ipv4(n, o1, o2, o3, o4) {
+            o1 = int(n / 16777216); n -= o1 * 16777216
+            o2 = int(n / 65536);    n -= o2 * 65536
+            o3 = int(n / 256);      n -= o3 * 256
+            o4 = n
+            return o1 "." o2 "." o3 "." o4
+        }
+
+        function block_to_prefix(blk, pfx, t) {
+            pfx = 32
+            t = blk
+
+            while (t > 1) {
+                t /= 2
+                pfx--
+            }
+
+            return pfx
+        }
+
+        function emit_v4_range(start_ip, cnt, s, n, max_align, blk, pfx) {
+            s = ipv4_to_int(start_ip)
+            n = cnt + 0
+
+            if (s < 0 || n < 1) return
+
+            while (n > 0) {
+
+                if (s == 0) {
+                    max_align = 4294967296
+                } else {
+                    max_align = 1
+
+                    while ((s % (max_align * 2)) == 0) max_align *= 2
+
+                }
+
+                blk = max_align
+
+                while (blk > n) blk /= 2
+
+                pfx = block_to_prefix(blk)
+                print int_to_ipv4(s) "/" pfx
+
+                s += blk
+                n -= blk
+            }
+
+        }
+
+        $1 == "apnic" {
+            status_ok = ($7 == "allocated" || (status_mode == "allocated-and-assigned" && $7 == "assigned"))
+            locale_ok = ($2 in cc)
+            family_ok = (family_mode == "all" || (family_mode == "ipv4" && $3 == "ipv4") || (family_mode == "ipv6" && $3 == "ipv6"))
+
+            if (status_ok && locale_ok && family_ok) {
+
+                if ($3 == "ipv4") {
+
+                    if ($5 ~ /^[0-9]+$/) emit_v4_range($4, $5)
+
+                } else if ($3 == "ipv6") {
+
+                    if ($5 ~ /^[0-9]+$/) print $4 "/" $5
+
+                }
+
+            }
+
+        }
+    ' "$TMPDIR/delegated"
+
+}
+
+aggregate_with_awk() {
+
+    awk '
+        function dec_to_bin(n, w, s, i) {
+            s = ""
+
+            for (i = 0; i < w; i++) {
+                s = (n % 2) s
+                n = int(n / 2)
+            }
+
+            return s
+        }
+
+        function bin_to_dec(b, n, i, c) {
+            n = 0
+
+            for (i = 1; i <= length(b); i++) {
+                c = substr(b, i, 1)
+                n = n * 2 + (c == "1" ? 1 : 0)
+            }
+
+            return n
+        }
+
+        function dec_to_hex4(n, d, s, i, x) {
+            d = "0123456789abcdef"
+            s = ""
+
+            for (i = 0; i < 4; i++) {
+                x = n % 16
+                s = substr(d, x + 1, 1) s
+                n = int(n / 16)
+            }
+
+            return s
+        }
+
+        function is_h16(x) { return (x ~ /^[0-9a-f]{1,4}$/) }
+
+        function hexval(c, d) {
+            d = index("0123456789abcdef", c)
+            return d ? d - 1 : -1
+        }
+
+        function hex_to_bin16(h, i, c, v, n) {
+            h = tolower(h)
+            n = 0
+
+            for (i = 1; i <= length(h); i++) {
+                c = substr(h, i, 1)
+                v = hexval(c)
+
+                if (v < 0) return ""
+
+                n = n * 16 + v
+            }
+
+            return dec_to_bin(n, 16)
+        }
+
+        function ipv4_to_bits(ip, a, i, o, bits) {
+            split(ip, a, ".")
+
+            if (length(a) != 4) return ""
+
+            bits = ""
+
+            for (i = 1; i <= 4; i++) {
+                o = a[i]
+
+                if (o !~ /^[0-9]+$/) return ""
+
+                o += 0
+
+                if (o < 0 || o > 255) return ""
+
+                bits = bits dec_to_bin(o, 8)
+            }
+
+            return bits
+        }
+
+        function ipv6_to_bits(ip, lower, n, left, right, lcnt, rcnt, miss, i, idx, bits, g, parts, la, ra, x) {
+            lower = tolower(ip)
+
+            if (index(lower, ".") > 0) return ""
+
+            n = split(lower, parts, "::")
+
+            if (n > 2) return ""
+
+            left = parts[1]
+            right = (n == 2 ? parts[2] : "")
+
+            lcnt = 0
+
+            if (left != "") lcnt = split(left, la, ":")
+
+            rcnt = 0
+
+            if (right != "") rcnt = split(right, ra, ":")
+
+            if (n == 1) {
+
+                if (lcnt != 8) return ""
+
+                miss = 0
+            } else {
+                miss = 8 - (lcnt + rcnt)
+
+                if (miss < 1) return ""
+
+            }
+
+            idx = 0
+
+            for (i = 1; i <= lcnt; i++) {
+
+                if (!is_h16(la[i])) return ""
+
+                g[++idx] = la[i]
+            }
+
+            for (i = 1; i <= miss; i++) g[++idx] = "0"
+
+            for (i = 1; i <= rcnt; i++) {
+
+                if (!is_h16(ra[i])) return ""
+
+                g[++idx] = ra[i]
+            }
+
+            if (idx != 8) return ""
+
+            bits = ""
+
+            for (i = 1; i <= 8; i++) {
+                x = hex_to_bin16(g[i])
+
+                if (x == "") return ""
+
+                bits = bits x
+            }
+
+            return bits
+        }
+
+        function bits_to_ipv4(full, i, out, oct) {
+            out = ""
+
+            for (i = 1; i <= 32; i += 8) {
+                oct = bin_to_dec(substr(full, i, 8))
+                out = out (out ? "." : "") oct
+            }
+
+            return out
+        }
+
+        function bits_to_ipv6(full, i, out, grp, n) {
+            out = ""
+
+            for (i = 1; i <= 128; i += 16) {
+                n = bin_to_dec(substr(full, i, 16))
+                grp = dec_to_hex4(n)
+                out = out (out ? ":" : "") grp
+            }
+
+            return out
+        }
+
+        function key(f, p, b) { return f "|" p "|" b }
+
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+
+            if (line == "") next
+
+            split(line, t, "/")
+
+            if (length(t) != 2) next
+
+            ip = t[1]
+            plen = t[2] + 0
+
+            fam = 0
+            bits = ""
+
+            if (ip ~ /\./) {
+                fam = 4
+
+                if (plen < 0 || plen > 32) next
+
+                bits = ipv4_to_bits(ip)
+
+                if (bits == "") next
+
+                maxp[4] = 32
+            } else {
+                fam = 6
+
+                if (plen < 0 || plen > 128) next
+
+                bits = ipv6_to_bits(ip)
+
+                if (bits == "") next
+
+                maxp[6] = 128
+            }
+
+            pref = substr(bits, 1, plen)
+            P[key(fam, plen, pref)] = 1
+        }
+
+        END {
+
+            for (k in P) {
+                split(k, a, /\|/)
+                f = a[1]
+                p = a[2]
+                b = a[3]
+
+                covered = 0
+
+                for (i = 0; i < p; i++) {
+                    k2 = key(f, i, substr(b, 1, i))
+
+                    if (k2 in P) {
+                        covered = 1
+                        break
+                    }
+
+                }
+
+                if (covered) D[k] = 1
+
+            }
+
+            for (k in D) delete P[k]
+
+            changed = 1
+
+            while (changed) {
+                changed = 0
+
+                for (f = 4; f <= 6; f += 2) {
+
+                    for (p = maxp[f]; p > 0; p--) {
+
+                        for (k in P) {
+                            split(k, a, /\|/)
+
+                            if (a[1] != f || a[2] != p) continue
+
+                            b = a[3]
+                            parent = substr(b, 1, p - 1)
+                            last = substr(b, p, 1)
+                            sib = parent ((last == "0") ? "1" : "0")
+                            ks = key(f, p, sib)
+
+                            if (ks in P) {
+                                delete P[k]
+                                delete P[ks]
+                                P[key(f, p - 1, parent)] = 1
+                                changed = 1
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            for (k in P) {
+                split(k, a, /\|/)
+                f = a[1]
+                p = a[2]
+                b = a[3]
+
+                full = b
+                lim = (f == 4 ? 32 : 128)
+
+                while (length(full) < lim) full = full "0"
+
+                if (f == 4) {
+                    print bits_to_ipv4(full) "/" p
+                } else {
+                    print bits_to_ipv6(full) "/" p
+                }
+
+            }
+
+        }
+    '
+
+}
+
+aggregate_cidrs() {
+
+    if need_cmd aggregate; then
+
+        aggregate
+
+    else
+
+        aggregate_with_awk
+
+    fi
+
+}
+
+sort_cidrs_natural() {
+
+    awk '
+        function dec_to_bin(n, w, s, i) {
+            s = ""
+
+            for (i = 0; i < w; i++) {
+                s = (n % 2) s
+                n = int(n / 2)
+            }
+
+            return s
+        }
+
+        function bin_to_dec(b, n, i, c) {
+            n = 0
+
+            for (i = 1; i <= length(b); i++) {
+                c = substr(b, i, 1)
+                n = n * 2 + (c == "1" ? 1 : 0)
+            }
+
+            return n
+        }
+
+        function dec_to_hex4(n, d, s, i, x) {
+            d = "0123456789abcdef"
+            s = ""
+
+            for (i = 0; i < 4; i++) {
+                x = n % 16
+                s = substr(d, x + 1, 1) s
+                n = int(n / 16)
+            }
+
+            return s
+        }
+
+        function is_h16(x) { return (x ~ /^[0-9a-f]{1,4}$/) }
+
+        function hexval(c, d) {
+            d = index("0123456789abcdef", c)
+            return d ? d - 1 : -1
+        }
+
+        function hex_to_bin16(h, i, c, v, n) {
+            h = tolower(h)
+            n = 0
+
+            for (i = 1; i <= length(h); i++) {
+                c = substr(h, i, 1)
+                v = hexval(c)
+
+                if (v < 0) return ""
+
+                n = n * 16 + v
+            }
+
+            return dec_to_bin(n, 16)
+        }
+
+        function ipv4_to_bits(ip, a, i, o, bits) {
+            split(ip, a, ".")
+
+            if (length(a) != 4) return ""
+
+            bits = ""
+
+            for (i = 1; i <= 4; i++) {
+                o = a[i]
+
+                if (o !~ /^[0-9]+$/) return ""
+
+                o += 0
+
+                if (o < 0 || o > 255) return ""
+
+                bits = bits dec_to_bin(o, 8)
+            }
+
+            return bits
+        }
+
+        function ipv6_to_bits(ip, lower, n, left, right, lcnt, rcnt, miss, i, idx, bits, g, parts, la, ra, x) {
+            lower = tolower(ip)
+
+            if (index(lower, ".") > 0) return ""
+
+            n = split(lower, parts, "::")
+
+            if (n > 2) return ""
+
+            left = parts[1]
+            right = (n == 2 ? parts[2] : "")
+
+            lcnt = 0
+
+            if (left != "") lcnt = split(left, la, ":")
+
+            rcnt = 0
+
+            if (right != "") rcnt = split(right, ra, ":")
+
+            if (n == 1) {
+
+                if (lcnt != 8) return ""
+
+                miss = 0
+            } else {
+                miss = 8 - (lcnt + rcnt)
+
+                if (miss < 1) return ""
+
+            }
+
+            idx = 0
+
+            for (i = 1; i <= lcnt; i++) {
+
+                if (!is_h16(la[i])) return ""
+
+                g[++idx] = la[i]
+            }
+
+            for (i = 1; i <= miss; i++) g[++idx] = "0"
+
+            for (i = 1; i <= rcnt; i++) {
+
+                if (!is_h16(ra[i])) return ""
+
+                g[++idx] = ra[i]
+            }
+
+            if (idx != 8) return ""
+
+            bits = ""
+
+            for (i = 1; i <= 8; i++) {
+                x = hex_to_bin16(g[i])
+
+                if (x == "") return ""
+
+                bits = bits x
+            }
+
+            return bits
+        }
+
+        function bits_to_ipv4(full, i, out, oct) {
+            out = ""
+
+            for (i = 1; i <= 32; i += 8) {
+                oct = bin_to_dec(substr(full, i, 8))
+                out = out (out ? "." : "") oct
+            }
+
+            return out
+        }
+
+        function bits_to_ipv6(full, i, out, grp, n) {
+            out = ""
+
+            for (i = 1; i <= 128; i += 16) {
+                n = bin_to_dec(substr(full, i, 16))
+                grp = dec_to_hex4(n)
+                out = out (out ? ":" : "") grp
+            }
+
+            return out
+        }
+
+        function key(f, p, b) { return f "|" p "|" b }
+
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+
+            if (line == "") next
+
+            split(line, t, "/")
+
+            if (length(t) != 2) next
+
+            ip = t[1]
+            plen = t[2] + 0
+
+            fam = 0
+            bits = ""
+
+            if (ip ~ /\./) {
+                fam = 4
+
+                if (plen < 0 || plen > 32) next
+
+                bits = ipv4_to_bits(ip)
+
+                if (bits == "") next
+
+            } else {
+                fam = 6
+
+                if (plen < 0 || plen > 128) next
+
+                bits = ipv6_to_bits(ip)
+
+                if (bits == "") next
+
+            }
+
+            pref = substr(bits, 1, plen)
+            P[key(fam, plen, pref)] = 1
+        }
+
+        END {
+
+            for (k in P) {
+                split(k, a, /\|/)
+                f = a[1]
+                p = a[2]
+                b = a[3]
+
+                full = b
+                lim = (f == 4 ? 32 : 128)
+
+                while (length(full) < lim) full = full "0"
+
+                if (f == 4) {
+                    cidr = bits_to_ipv4(full) "/" p
+                } else {
+                    cidr = bits_to_ipv6(full) "/" p
+                }
+
+                printf "%d|%s|%03d|%s\n", f, full, p, cidr
+            }
+
+        }
+    ' | sort -t'|' -k1,1n -k2,2 -k3,3n | awk -F'|' '{ print $4 }'
+
+}
+
+minimise_ipv6_cidrs() {
+
+    awk '
+        function trim_hextet(h) {
+            sub(/^0+/, "", h)
+            return (h == "" ? "0" : h)
+        }
+
+        function join_range(arr, s, e, i, out) {
+            out = ""
+
+            for (i = s; i <= e; i++) out = out (out ? ":" : "") arr[i]
+
+            return out
+        }
+
+        function compress_ipv6(ip, n, i, run_s, run_l, best_s, best_l, left, right) {
+            n = split(ip, h, ":")
+
+            if (n != 8) return ip
+
+            for (i = 1; i <= 8; i++) h[i] = tolower(trim_hextet(h[i]))
+
+            best_s = 0
+            best_l = 0
+            run_s = 0
+            run_l = 0
+
+            for (i = 1; i <= 8; i++) {
+
+                if (h[i] == "0") {
+
+                    if (run_l == 0) run_s = i
+
+                    run_l++
+
+                    if (run_l > best_l) {
+                        best_l = run_l
+                        best_s = run_s
+                    }
+
+                } else {
+                    run_l = 0
+                }
+
+            }
+
+            if (best_l < 2) return join_range(h, 1, 8)
+
+            left = (best_s > 1 ? join_range(h, 1, best_s - 1) : "")
+            right = (best_s + best_l <= 8 ? join_range(h, best_s + best_l, 8) : "")
+
+            if (left == "" && right == "") return "::"
+
+            if (left == "") return "::" right
+
+            if (right == "") return left "::"
+
+            return left "::" right
+        }
+
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+
+            if (line == "") next
+
+            split(line, t, "/")
+
+            if (length(t) != 2) {
+                print line
+                next
+            }
+
+            ip = t[1]
+            p = t[2]
+
+            if (index(ip, ":") > 0) {
+                print compress_ipv6(ip) "/" p
+            } else {
+                print line
+            }
+
+        }
+    '
+
+}
+
+generate_output() {
+
+    {
+        extract_cidrs
+
+        if [ -n "$CUSTOM_CIDRS_FILE" ] && [ -s "$CUSTOM_CIDRS_FILE" ]; then
+            cat "$CUSTOM_CIDRS_FILE"
+        fi
+
+    } | aggregate_cidrs | sort_cidrs_natural | {
+
+        if [ "$MINIMISE_IPV6" -eq 1 ]; then
+
+            minimise_ipv6_cidrs
+
+        else
+
+            cat
+
+        fi
+
+    }
+
+}
+
+write_output() {
+
+    if [ -z "$OUTPUT_FILE" ] || [ "$OUTPUT_FILE" = "-" ]; then
+
+        generate_output
+
+        return
+    fi
+
+    case "$OUTPUT_FILE" in
+        */*)
+            outdir=${OUTPUT_FILE%/*}
+
+            [ -n "$outdir" ] && mkdir -p "$outdir"
+
+            ;;
+    esac
+
+    generate_output > "$OUTPUT_FILE"
+
+}
+
+parse_args() {
+
+    ARGS_FILE="$TMPDIR/args"
+    CUSTOM_ARGS_FILE="$TMPDIR/custom_args"
+    : > "$ARGS_FILE"
+    : > "$CUSTOM_ARGS_FILE"
+
+    while [ "$#" -gt 0 ]; do
+
+        case "$1" in
+            -a|--allocated-only)
+                STATUS_MODE="allocated-only"
+                shift
+                ;;
+            -A|--allocated-and-assigned)
+                STATUS_MODE="allocated-and-assigned"
+                shift
+                ;;
+            -c|--custom)
+
+                [ "$#" -ge 2 ] || die "missing argument for $1"
+
+                [ -n "$2" ] || die "missing argument for $1"
+
+                printf '%s\n' "$2" >> "$CUSTOM_ARGS_FILE"
+                shift 2
+                ;;
+            -c=*|--custom=*)
+                custom_arg=${1#*=}
+
+                [ -n "$custom_arg" ] || die "missing argument for ${1%%=*}"
+
+                printf '%s\n' "$custom_arg" >> "$CUSTOM_ARGS_FILE"
+                shift
+                ;;
+            -h|--help)
+
+                usage
+
+                exit 0
+                ;;
+            -i|--ipv4-only)
+
+                [ "$FAMILY_MODE" = "all" ] || die "conflicting family options: --ipv4-only and --ipv6-only"
+
+                FAMILY_MODE="ipv4"
+                shift
+                ;;
+            -I|--ipv6-only)
+
+                [ "$FAMILY_MODE" = "all" ] || die "conflicting family options: --ipv4-only and --ipv6-only"
+
+                FAMILY_MODE="ipv6"
+                shift
+                ;;
+            -l|--locale|--locales)
+
+                [ "$#" -ge 2 ] || die "missing argument for $1"
+
+                [ -n "$2" ] || die "missing argument for $1"
+
+                printf '%s\n' "$2" >> "$ARGS_FILE"
+                shift 2
+                ;;
+            -l=*|--locale=*|--locales=*)
+                locale_arg=${1#*=}
+
+                [ -n "$locale_arg" ] || die "missing argument for ${1%%=*}"
+
+                printf '%s\n' "$locale_arg" >> "$ARGS_FILE"
+                shift
+                ;;
+            -m|--minimise-ipv6)
+                MINIMISE_IPV6=1
+                shift
+                ;;
+            -o|--output)
+
+                [ "$#" -ge 2 ] || die "missing argument for $1"
+
+                OUTPUT_FILE=$2
+                shift 2
+                ;;
+            --output=*)
+                OUTPUT_FILE=${1#--output=}
+
+                [ -n "$OUTPUT_FILE" ] || die "missing argument for --output"
+
+                shift
+                ;;
+            -s|--self-test)
+                RUN_SELF_TEST=1
+                shift
+                ;;
+            -v|--version)
+                printf 'CIDRnt v%s\n' "$VERSION"
+                exit 0
+                ;;
+            --)
+                shift
+
+                while [ "$#" -gt 0 ]; do
+                    printf '%s\n' "$1" >> "$ARGS_FILE"
+                    shift
+                done
+
+                break
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                printf '%s\n' "$1" >> "$ARGS_FILE"
+                shift
+                ;;
+        esac
+
+    done
+
+}
+
+prepare_custom_cidrs() {
+
+    CUSTOM_CIDRS_FILE="$TMPDIR/custom.cidrs"
+    : > "$CUSTOM_CIDRS_FILE"
+
+    [ -s "$CUSTOM_ARGS_FILE" ] || return 0
+
+    awk '
+        function is_h16(x) { return (x ~ /^[0-9a-f]{1,4}$/) }
+
+        function valid_ipv4(ip, a, i, o) {
+
+            if (split(ip, a, ".") != 4) return 0
+
+            for (i = 1; i <= 4; i++) {
+                o = a[i]
+
+                if (o !~ /^[0-9]+$/) return 0
+
+                o += 0
+
+                if (o < 0 || o > 255) return 0
+
+            }
+
+            return 1
+        }
+
+        function valid_ipv6(ip, lower, n, left, right, lcnt, rcnt, miss, i, parts, la, ra) {
+            lower = tolower(ip)
+
+            if (index(lower, ".") > 0) return 0
+
+            n = split(lower, parts, "::")
+
+            if (n > 2) return 0
+
+            left = parts[1]
+            right = (n == 2 ? parts[2] : "")
+
+            lcnt = 0
+
+            if (left != "") lcnt = split(left, la, ":")
+
+            rcnt = 0
+
+            if (right != "") rcnt = split(right, ra, ":")
+
+            if (n == 1) {
+
+                if (lcnt != 8) return 0
+
+                miss = 0
+            } else {
+                miss = 8 - (lcnt + rcnt)
+
+                if (miss < 1) return 0
+
+            }
+
+            for (i = 1; i <= lcnt; i++) if (!is_h16(la[i])) return 0
+
+            for (i = 1; i <= rcnt; i++) if (!is_h16(ra[i])) return 0
+
+            return 1
+        }
+
+        function bad(tok) {
+            printf "invalid custom IP/CIDR: %s\n", tok > "/dev/stderr"
+            err = 1
+        }
+
+        function emit(tok, n, t, ip, p) {
+
+            if (tok == "") return
+
+            if (index(tok, "/") > 0) {
+                n = split(tok, t, "/")
+
+                if (n != 2 || t[2] !~ /^[0-9]+$/) { bad(tok); return }
+
+                ip = t[1]
+                p = t[2] + 0
+
+                if (index(ip, ".") > 0) {
+
+                    if (!valid_ipv4(ip) || p < 0 || p > 32) { bad(tok); return }
+
+                    print ip "/" p
+                    return
+                }
+
+                if (index(ip, ":") > 0) {
+
+                    if (!valid_ipv6(ip) || p < 0 || p > 128) { bad(tok); return }
+
+                    print tolower(ip) "/" p
+                    return
+                }
+
+                bad(tok)
+                return
+            }
+
+            if (index(tok, ".") > 0) {
+
+                if (!valid_ipv4(tok)) { bad(tok); return }
+
+                print tok "/32"
+                return
+            }
+
+            if (index(tok, ":") > 0) {
+
+                if (!valid_ipv6(tok)) { bad(tok); return }
+
+                print tolower(tok) "/128"
+                return
+            }
+
+            bad(tok)
+        }
+
+        {
+            n = split($0, a, /[[:space:],;]+/)
+
+            for (i = 1; i <= n; i++) emit(a[i])
+
+        }
+
+        END {
+
+            if (err) exit 1
+
+        }
+    ' "$CUSTOM_ARGS_FILE" > "$TMPDIR/custom.cidrs.tmp" || die "failed parsing custom IP/CIDR input"
+
+    awk '!seen[$0]++' "$TMPDIR/custom.cidrs.tmp" > "$CUSTOM_CIDRS_FILE"
+
+}
+
+self_test() {
+
+    self_test_diff() {
+
+        label=$1
+        want=$2
+        got=$3
+
+        if diff -u "$want" "$got" >/dev/null 2>&1; then
+            printf 'ok  - %s\n' "$label"
+            return 0
+        fi
+
+        printf 'not ok - %s\n' "$label" >&2
+
+        diff -u "$want" "$got" >&2 || true
+
+        return 1
+
+    }
+
+    self_test_reset_parse_state() {
+        FAMILY_MODE="all"
+        MINIMISE_IPV6=0
+        OUTPUT_FILE=""
+        RUN_SELF_TEST=0
+        STATUS_MODE="allocated-and-assigned"
+    }
+
+    self_test_section() {
+        printf '\n%s:\n' "$1"
+    }
+
+    self_test_pass() {
+        printf 'ok  - %s\n' "$1"
+    }
+
+    self_test_fail() {
+        label=$1
+        shift
+        printf 'not ok - %s\n' "$label" >&2
+
+        while [ "$#" -gt 0 ]; do
+            printf '%s\n' "$1" >&2
+            shift
+        done
+
+        fail=1
+    }
+
+    self_test_assert_eq() {
+        label=$1
+        got=$2
+        want=$3
+        key=${4:-value}
+
+        if [ "$got" = "$want" ]; then
+
+            self_test_pass "$label"
+
+        else
+
+            self_test_fail "$label" "got:  $key=$got" "want: $key=$want"
+
+        fi
+
+    }
+
+    self_test_parse_state() {
+        label=$1
+        varname=$2
+        want=$3
+        shift 3
+
+        self_test_reset_parse_state
+
+        parse_args "$@"
+
+        eval "got=\${$varname}"
+
+        self_test_assert_eq "$label" "$got" "$want" "$varname"
+
+    }
+
+    self_test_assert_usage() {
+        label=$1
+        shift
+
+        if out=$( (parse_args "$@") 2>&1 ); then
+
+            if printf '%s\n' "$out" | awk 'BEGIN{ok=0} /^Usage:/{ok=1} END{exit(ok?0:1)}'; then
+
+                self_test_pass "$label"
+
+            else
+
+                self_test_fail "$label" "$out"
+
+            fi
+
+        else
+
+            self_test_fail "$label"
+
+        fi
+
+    }
+
+    self_test_assert_version() {
+        label=$1
+        shift
+
+        if out=$( (parse_args "$@") 2>&1 ); then
+
+            self_test_assert_eq "$label" "$out" "CIDRnt v$VERSION" "version"
+
+        else
+
+            self_test_fail "$label"
+
+        fi
+
+    }
+
+    need_cmd awk || die "awk is required"
+
+    need_cmd sort || die "sort is required"
+
+    need_cmd diff || die "diff is required"
+
+    mkdir -p "$TMPDIR"
+
+    fail=0
+
+    self_test_section "option parsing"
+
+    parse_locales NZ
+
+    self_test_parse_state "option parsing (-a)" STATUS_MODE "allocated-only" -a NZ
+
+    self_test_parse_state "option parsing (--allocated-only)" STATUS_MODE "allocated-only" --allocated-only NZ
+
+    self_test_reset_parse_state
+
+    parse_args -c "1.2.3.0/24,2001:db8::/32" --custom=203.0.113.7 -c "2001:db8::1"
+
+    cat > "$TMPDIR/parse_args_custom_options.want" <<'EOF'
+1.2.3.0/24,2001:db8::/32
+203.0.113.7
+2001:db8::1
+EOF
+
+    self_test_diff \
+        "option parsing (-c/--custom and *= variants)" \
+        "$TMPDIR/parse_args_custom_options.want" \
+        "$CUSTOM_ARGS_FILE" || fail=1
+
+    self_test_assert_usage "option parsing (-h)" -h
+
+    self_test_assert_usage "option parsing (--help)" --help
+
+    self_test_parse_state "option parsing (-i)" FAMILY_MODE "ipv4" -i NZ
+
+    self_test_parse_state "option parsing (--ipv4-only)" FAMILY_MODE "ipv4" --ipv4-only NZ
+
+    self_test_parse_state "option parsing (-I)" FAMILY_MODE "ipv6" -I NZ
+
+    self_test_parse_state "option parsing (--ipv6-only)" FAMILY_MODE "ipv6" --ipv6-only NZ
+
+    self_test_reset_parse_state
+
+    parse_args -l NZ,AU --locale=JP --locales KR -A
+
+    cat > "$TMPDIR/parse_args_locale_options.want" <<'EOF'
+NZ,AU
+JP
+KR
+EOF
+
+    if [ "$STATUS_MODE" = "allocated-and-assigned" ]; then
+
+        self_test_diff \
+            "option parsing (-l/--locale/--locales and *= variants)" \
+            "$TMPDIR/parse_args_locale_options.want" \
+            "$ARGS_FILE" || fail=1
+
+    else
+
+        self_test_fail \
+            "option parsing (-l/--locale/--locales and *= variants)" \
+            "STATUS_MODE=$STATUS_MODE"
+
+    fi
+
+    self_test_parse_state "option parsing (-m)" MINIMISE_IPV6 "1" -m NZ
+
+    self_test_parse_state "option parsing (--minimise-ipv6)" MINIMISE_IPV6 "1" --minimise-ipv6 NZ
+
+    self_test_reset_parse_state
+
+    parse_args -o "$TMPDIR/out/cli.txt" NZ AU
+
+    cat > "$TMPDIR/parse_args_output.want" <<'EOF'
+NZ
+AU
+EOF
+
+    if [ "$OUTPUT_FILE" = "$TMPDIR/out/cli.txt" ] &&
+
+       [ "$STATUS_MODE" = "allocated-and-assigned" ]; then
+
+        self_test_diff \
+            "option parsing (-o FILE)" \
+            "$TMPDIR/parse_args_output.want" \
+            "$ARGS_FILE" || fail=1
+
+    else
+
+        self_test_fail \
+            "option parsing (-o FILE)" \
+            "OUTPUT_FILE=$OUTPUT_FILE" \
+            "STATUS_MODE=$STATUS_MODE"
+
+        diff -u "$TMPDIR/parse_args_output.want" "$ARGS_FILE" >&2 || true
+
+    fi
+
+    self_test_reset_parse_state
+
+    parse_args --allocated-only --output="$TMPDIR/out/cli2.txt" "NZ,AU"
+
+    cat > "$TMPDIR/parse_args_long_output.want" <<'EOF'
+NZ,AU
+EOF
+
+    if [ "$OUTPUT_FILE" = "$TMPDIR/out/cli2.txt" ] &&
+
+       [ "$STATUS_MODE" = "allocated-only" ]; then
+
+        self_test_diff \
+            "option parsing (--output=FILE)" \
+            "$TMPDIR/parse_args_long_output.want" \
+            "$ARGS_FILE" || fail=1
+
+    else
+
+        self_test_fail \
+            "option parsing (--output=FILE)" \
+            "OUTPUT_FILE=$OUTPUT_FILE" \
+            "STATUS_MODE=$STATUS_MODE"
+
+        diff -u "$TMPDIR/parse_args_long_output.want" "$ARGS_FILE" >&2 || true
+
+    fi
+
+    self_test_parse_state "option parsing (--self-test)" RUN_SELF_TEST "1" --self-test NZ
+
+    self_test_assert_version "option parsing (-v)" -v
+
+    self_test_assert_version "option parsing (--version)" --version
+
+    self_test_reset_parse_state
+
+    parse_args NZ --allocated-only AU
+
+    cat > "$TMPDIR/parse_args_mixed_order.want" <<'EOF'
+NZ
+AU
+EOF
+
+    if [ "$STATUS_MODE" = "allocated-only" ]; then
+
+        self_test_diff \
+            "option parsing (mixed order positional + options)" \
+            "$TMPDIR/parse_args_mixed_order.want" \
+            "$ARGS_FILE" || fail=1
+
+    else
+
+        self_test_fail \
+            "option parsing (mixed order positional + options)" \
+            "STATUS_MODE=$STATUS_MODE"
+
+    fi
+
+    self_test_section "status and family filters"
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+apnic|NZ|ipv4|1.0.1.0|256|20200101|assigned
+EOF
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="all"
+
+    extract_cidrs | sort > "$TMPDIR/allocated_only_filter.got"
+
+    cat > "$TMPDIR/allocated_only_filter.want" <<'EOF'
+1.0.0.0/24
+EOF
+
+    self_test_diff \
+        "allocated-only filter" \
+        "$TMPDIR/allocated_only_filter.want" \
+        "$TMPDIR/allocated_only_filter.got" || fail=1
+
+    STATUS_MODE="allocated-and-assigned"
+    FAMILY_MODE="all"
+
+    extract_cidrs | sort > "$TMPDIR/allocated_and_assigned_filter.got"
+
+    cat > "$TMPDIR/allocated_and_assigned_filter.want" <<'EOF'
+1.0.0.0/24
+1.0.1.0/24
+EOF
+
+    self_test_diff \
+        "allocated-and-assigned filter" \
+        "$TMPDIR/allocated_and_assigned_filter.want" \
+        "$TMPDIR/allocated_and_assigned_filter.got" || fail=1
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+apnic|NZ|ipv6|2001:db8::|32|20200101|allocated
+EOF
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="ipv4"
+
+    extract_cidrs | sort > "$TMPDIR/ipv4_only.got"
+
+    cat > "$TMPDIR/ipv4_only.want" <<'EOF'
+1.0.0.0/24
+EOF
+
+    self_test_diff \
+        "ipv4-only filter" \
+        "$TMPDIR/ipv4_only.want" \
+        "$TMPDIR/ipv4_only.got" || fail=1
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="ipv6"
+
+    extract_cidrs | sort > "$TMPDIR/ipv6_only.got"
+
+    cat > "$TMPDIR/ipv6_only.want" <<'EOF'
+2001:db8::/32
+EOF
+
+    self_test_diff \
+        "ipv6-only filter" \
+        "$TMPDIR/ipv6_only.want" \
+        "$TMPDIR/ipv6_only.got" || fail=1
+
+    self_test_section "formatting and output"
+
+    cat > "$TMPDIR/minimise_ipv6.in" <<'EOF'
+2001:0db8:0000:0000:0000:0000:0000:0000/32
+2001:0db8:0000:0000:0000:0000:0000:0001/128
+1.2.3.0/24
+EOF
+
+    cat > "$TMPDIR/minimise_ipv6.want" <<'EOF'
+2001:db8::/32
+2001:db8::1/128
+1.2.3.0/24
+EOF
+
+    minimise_ipv6_cidrs < "$TMPDIR/minimise_ipv6.in" > "$TMPDIR/minimise_ipv6.got"
+
+    self_test_diff \
+        "ipv6 minimization" \
+        "$TMPDIR/minimise_ipv6.want" \
+        "$TMPDIR/minimise_ipv6.got" || fail=1
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+EOF
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="all"
+    OUTPUT_FILE="$TMPDIR/out/file_output.txt"
+    MINIMISE_IPV6=0
+
+    write_output
+
+    cat > "$TMPDIR/file_output.want" <<'EOF'
+1.0.0.0/24
+EOF
+
+    self_test_diff \
+        "file output" \
+        "$TMPDIR/file_output.want" \
+        "$OUTPUT_FILE" || fail=1
+
+    self_test_section "aggregation and decomposition"
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+EOF
+
+    self_test_reset_parse_state
+
+    parse_args NZ -c "1.0.1.0/24" --custom "2001:db8::/32"
+
+    if [ -s "$ARGS_FILE" ]; then
+        # shellcheck disable=SC2046
+        set -- $(cat "$ARGS_FILE")
+    else
+        set --
+    fi
+
+    parse_locales "$@"
+
+    prepare_custom_cidrs
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="all"
+
+    generate_output > "$TMPDIR/custom_integration.got"
+
+    cat > "$TMPDIR/custom_integration.want" <<'EOF'
+1.0.0.0/23
+2001:0db8:0000:0000:0000:0000:0000:0000/32
+EOF
+
+    self_test_diff \
+        "custom CIDRs integrated into pipeline" \
+        "$TMPDIR/custom_integration.want" \
+        "$TMPDIR/custom_integration.got" || fail=1
+
+    cat > "$TMPDIR/aggregate_and_sort.in" <<'EOF'
+10.0.0.0/24
+10.0.1.0/24
+10.0.2.0/24
+10.0.3.0/24
+10.0.0.0/25
+2001:db8::/33
+2001:db8:8000::/33
+EOF
+
+    cat > "$TMPDIR/aggregate_and_sort.want" <<'EOF'
+10.0.0.0/22
+2001:0db8:0000:0000:0000:0000:0000:0000/32
+EOF
+
+    aggregate_cidrs < "$TMPDIR/aggregate_and_sort.in" | sort_cidrs_natural > "$TMPDIR/aggregate_and_sort.got"
+
+    self_test_diff \
+        "aggregation pipeline" \
+        "$TMPDIR/aggregate_and_sort.want" \
+        "$TMPDIR/aggregate_and_sort.got" || fail=1
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|10.0.0.0|768|20200101|allocated
+EOF
+
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="all"
+
+    extract_cidrs | sort > "$TMPDIR/ipv4_range_decomposition.got"
+
+    cat > "$TMPDIR/ipv4_range_decomposition.want" <<'EOF'
+10.0.0.0/23
+10.0.2.0/24
+EOF
+
+    self_test_diff \
+        "ipv4 range decomposition" \
+        "$TMPDIR/ipv4_range_decomposition.want" \
+        "$TMPDIR/ipv4_range_decomposition.got" || fail=1
+
+    if [ "$fail" -eq 0 ]; then
+        printf '\nself-test: PASS\n'
+        return 0
+    fi
+
+    printf '\nself-test: FAIL\n' >&2
+    return 1
+}
+
+main() {
+
+    mkdir -p "$TMPDIR"
+
+    parse_args "$@"
+
+    if [ "$RUN_SELF_TEST" -eq 1 ]; then
+
+        self_test
+
+        exit $?
+    fi
+
+    if [ -s "$ARGS_FILE" ]; then
+        # shellcheck disable=SC2046
+        set -- $(cat "$ARGS_FILE")
+    else
+        set --
+    fi
+
+    parse_locales "$@"
+
+    prepare_custom_cidrs
+
+    fetch_apnic
+
+    write_output
+
+}
+
+main "$@"
