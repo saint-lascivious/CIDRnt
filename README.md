@@ -64,7 +64,7 @@ This has seen quite some development over quite some time locally, the GitHub re
   Add locale(s) to include. May be used multiple times.  
   LOCALE may be a single code (NZ) or a list (NZ,AU;JP).  
   Also supports `-l=...`, `--locale=...`, `--locales=...`
-- `-m`, `--minimise-ipv6`  
+- `-m`, `--minimise-ipv6`, `--minimize-ipv6`  
   Minimise IPv6 formatting in output (RFC5952-style compression).
 - `-o`, `--output`  
   Write output to file instead of stdout, use `-` for stdout.

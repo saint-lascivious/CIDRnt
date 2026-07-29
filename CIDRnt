@@ -17,7 +17,7 @@ STATUS_MODE="allocated-and-assigned"
 MINIMISE_IPV6=0
 OUTPUT_FILE=""
 TMPDIR="${TMPDIR:-/tmp}/cidrnt.$$"
-VERSION=0.0.1
+VERSION=0.0.2
 
 cleanup() {
 
@@ -83,7 +83,7 @@ Options:
       Add locale(s) to include. May be used multiple times.
       LOCALE may be a single code (NZ) or a list (NZ,AU;JP).
       Also supports -l=..., --locale=..., --locales=...
-  -m, --minimise-ipv6
+  -m, --minimise-ipv6, --minimize-ipv6
       Minimise IPv6 formatting in output (RFC5952-style compression).
   -o, --output FILE
       Write output to file instead of stdout, use - for stdout.
@@ -1225,7 +1225,7 @@ parse_args() {
                 printf '%s\n' "$locale_arg" >> "$ARGS_FILE"
                 shift
                 ;;
-            -m|--minimise-ipv6)
+            -m|--minimise-ipv6|--minimize-ipv6)
                 MINIMISE_IPV6=1
                 shift
                 ;;
