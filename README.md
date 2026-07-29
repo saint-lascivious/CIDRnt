@@ -53,7 +53,7 @@ This has seen quite some development over quite some time locally, the GitHub re
   Add custom IP/CIDR entries. May be used multiple times.  
   LIST may be a single entry or a list split by comma/semicolon/space.  
   Bare IPs are accepted and converted to /32 (IPv4) or /128 (IPv6).  
-  Also supports `-c=...`, `--custom=...`  
+  Also supports `-c=...`, `--custom=...`
 - `-h`, `--help`  
   Show help and exit.
 - `-i`, `--ipv4-only`  
@@ -63,8 +63,8 @@ This has seen quite some development over quite some time locally, the GitHub re
 - `-l`, `--locale LOCALE`  
   Add locale(s) to include. May be used multiple times.  
   LOCALE may be a single code (NZ) or a list (NZ,AU;JP).  
-  Also supports `-l=...`, `--locale=...`, `--locales=...`  
-- `-m`, `--minimise-ipv6`
+  Also supports `-l=...`, `--locale=...`, `--locales=...`
+- `-m`, `--minimise-ipv6`  
   Minimise IPv6 formatting in output (RFC5952-style compression).
 - `-o`, `--output`  
   Write output to file instead of stdout, use `-` for stdout.
