@@ -1,0 +1,74 @@
+#!/bin/sh
+
+set -eu
+
+CIDRNT="${CIDRNT:-./CIDRnt}"
+OUTPUT_DIR="${OUTPUT_DIR:-.}"
+
+# APNIC locales of particular interest.
+#
+# Add/remove ISO-3166 alpha-2 codes here as required.
+LOCALES="
+AU
+BD
+CN
+HK
+ID
+IN
+JP
+KH
+KR
+LA
+LK
+MM
+MN
+MO
+MY
+NP
+NZ
+PH
+PK
+SG
+TH
+TW
+VN
+"
+
+mkdir -p "$OUTPUT_DIR"
+
+for locale in $LOCALES; do
+
+    for status in allocated-only allocated-and-assigned; do
+
+        case "$status" in
+            allocated-only)
+                status_arg="--allocated-only"
+                ;;
+            allocated-and-assigned)
+                status_arg="--allocated-and-assigned"
+                ;;
+        esac
+
+        for family in ipv4-only ipv6-only; do
+
+            case "$family" in
+                ipv4-only)
+                    family_arg="--ipv4-only"
+                    ;;
+                ipv6-only)
+                    family_arg="--ipv6-only"
+                    ;;
+            esac
+
+            output="$OUTPUT_DIR/$status-$family-$(printf '%s' "$locale" | tr '[:upper:]' '[:lower:]').txt"
+
+            printf '%s\n' "$status_arg $family_arg $locale -> $output" >&2
+
+            "$CIDRNT" "$status_arg" "$family_arg" "$locale" > "$output"
+
+        done
+
+    done
+
+done
+
