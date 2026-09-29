@@ -3,11 +3,8 @@
 set -eu
 
 CIDRNT="${CIDRNT:-./CIDRnt}"
-OUTPUT_DIR="${OUTPUT_DIR:-.}"
+OUTPUT_DIR="${OUTPUT_DIR:-./examples}"
 
-# APNIC locales of particular interest.
-#
-# Add/remove ISO-3166 alpha-2 codes here as required.
 LOCALES="
 AU
 BD
@@ -71,4 +68,3 @@ for locale in $LOCALES; do
     done
 
 done
-
