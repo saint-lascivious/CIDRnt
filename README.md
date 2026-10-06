@@ -40,8 +40,10 @@ This has seen quite some development over quite some time locally, the GitHub re
 ## Usage
 
 ```sh
-./CIDRnt [options] [LOCALE ...]
+./CIDRnt [options] LOCALE [LOCALE ...]
 ```
+
+At least one ISO-3166 alpha-2 locale is required.
 
 ## Options
 
@@ -65,10 +67,19 @@ This has seen quite some development over quite some time locally, the GitHub re
   Add locale(s) to include. May be used multiple times.  
   LOCALE may be a single code (NZ) or a list (NZ,AU;JP).  
   Also supports `-l=...`, `--locale=...`, `--locales=...`
+- `-L`, `--list`, `--list-locales [LETTER]`
+  Fetch RIR stats, list all available locale codes, and exit.
+  When LETTER (a single character) is given, only locales
+  beginning with that letter are listed (case insensitive).
+  A summary of matched vs total locales is printed to stderr.
+  Also supports `--list=LETTER` and `--list-locales=LETTER`.
 - `-m`, `--minimise-ipv6`, `--minimize-ipv6`  
   Minimise IPv6 formatting in output (RFC5952-style compression).
 - `-o`, `--output`  
   Write output to file instead of stdout, use `-` for stdout.
+- `-r`, `--refresh`
+  Bypass the local RIR data cache and fetch fresh data.
+  Successful downloads still update the cache.
 - `-s`, `--self-test`  
   Perform local tests and exit.
 - `-v`, `--version`  
@@ -77,9 +88,6 @@ This has seen quite some development over quite some time locally, the GitHub re
 ## Examples
 
 ```sh
-# Default locale (NZ)
-./CIDRnt
-
 # Positional locales
 ./CIDRnt NZ
 ./CIDRnt NZ AU
@@ -101,6 +109,14 @@ This has seen quite some development over quite some time locally, the GitHub re
 
 # Mixed positional + locale flags
 ./CIDRnt NZ --locale AU -l JP
+
+# List locales
+./CIDRnt --list
+./CIDRnt --list-locales
+
+# List locales starting with ...
+./CIDRnt --list A
+./CIDRnt --list-locales B
 
 # Status/family filters
 ./CIDRnt --allocated-only NZ AU
@@ -128,5 +144,5 @@ This has seen quite some development over quite some time locally, the GitHub re
 - Output is plaintext CIDR notation (IPv4/IPv6), one per line.
 - Temporary files created under `$TMPDIR`; cleaned on exit.
 - APNIC data is cached at: `$CACHE_FILE`
-- Cache TTL is controlled by CACHE_TTL_SECONDS (default: 86400).
+- Cache TTL is controlled by CACHE_TTL_SECONDS (default: 604800).
   Set CACHE_TTL_SECONDS=0 to disable cache reuse.

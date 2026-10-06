@@ -1,0 +1,25 @@
+name: update locales map
+on:
+  schedule:
+    - cron: '23 1 * * 1'
+  push:
+    paths:
+      - scripts/CIDRnt-locales-map-gen.sh
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: locales map gen
+        run: sh scripts/CIDRnt-locales-map-gen.sh resources/locales_map/locales.map
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "CIDRnt: update locales.map"
+          title: "update locales.map"
+          branch: bot/locales-map-gen
+          add-paths: |
+            resources/locales_map/locales.map

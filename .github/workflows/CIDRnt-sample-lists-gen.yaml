@@ -1,0 +1,26 @@
+name: update sample lists
+on:
+  schedule:
+    - cron: '56 4 * * 1'
+  push:
+    paths:
+      - scripts/CIDRnt-sample-lists-gen.sh
+      - CIDRnt
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sample lists gen
+        run: sh scripts/CIDRnt-sample-lists-gen.sh resources/sample_lists
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "CIDRnt: update sample lists"
+          title: "update sample lists"
+          branch: bot/sample-lists-gen
+          add-paths: |
+            resources/sample_lists/*

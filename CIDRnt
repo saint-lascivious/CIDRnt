@@ -1,23 +1,36 @@
 #!/bin/sh
 
-# CIDRnt - Generate geographic CIDR lists from APNIC delegated stats.
+#   ___ _____ _____ _____  _____          _      ___     ____ ___   ___  
+#  │  _╱ ____│_   _│  __ ╲│  __ ╲ _      │ │  _ │_  │   ╱ ╱_ │__ ╲ ╱ _ ╲ 
+#  │ ││ │      │ │ │ │  │ │ │__) (_)_ __ │ │_(_│_)│ │  ╱ ╱ │ │  ) │ (_) │
+#  │ ││ │      │ │ │ │  │ │  _  ╱  │ '_ ╲│ __│    │ │ ╱ ╱  │ │ ╱ ╱ > _ < 
+#  │ ││ │____ _│ │_│ │__│ │ │ ╲ ╲ _│ │ │ │ │_ _ _ │ │╱ ╱   │ │╱ ╱_│ (_) │
+#  │ │_╲_____│_____│_____╱│_│  ╲_(_)_│ │_│╲__(_│_)│ ╱_╱    │_│____│╲___╱ 
+#  │___│                                        │___│                    
 
-set -eu
+#    CIDRnt - Generate geographic CIDR lists from RIR delegated stats.
 
-APNIC_URL="https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
+set -euf
+
+BRANCH="master"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-/tmp/.cache}}/cidrnt"
-CACHE_FILE="$CACHE_DIR/delegated-apnic-latest"
-CACHE_STAMP="$CACHE_DIR/delegated-apnic-latest.epoch"
-CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-86400}"
+CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-604800}"
 CUSTOM_ARGS_FILE=""
 CUSTOM_CIDRS_FILE=""
 FAMILY_MODE="all"
-RUN_SELF_TEST=0
-STATUS_MODE="allocated-and-assigned"
+LIST_LOCALES=0
+LIST_LOCALES_FILTER=""
 MINIMISE_IPV6=0
 OUTPUT_FILE=""
+REFRESH_CACHE=0
+RIR_NAMES="afrinic apnic arin lacnic ripencc"
+RUN_SELF_TEST=0
+STATUS_MODE="allocated-and-assigned"
 TMPDIR="${TMPDIR:-/tmp}/cidrnt.$$"
-VERSION=0.2.0
+VERSION=0.9.9
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+RIR_LOCALE_MAP="$SCRIPT_DIR/resources/locales_map/locales.map"
 
 cleanup() {
 
@@ -58,10 +71,12 @@ die() {
 usage_text() {
 
     cat <<EOF
-CIDRnt - Generate geographic CIDR lists from APNIC delegated stats.
+CIDRnt - Generate geographic CIDR lists from RIR delegated stats.
 
 Usage:
-  ./CIDRnt [options] [LOCALE ...]
+  ./CIDRnt [options] LOCALE [LOCALE ...]
+
+At least one ISO-3166 alpha-2 locale is required.
 
 Options:
   -a, --allocated-only
@@ -84,15 +99,98 @@ Options:
       Add locale(s) to include. May be used multiple times.
       LOCALE may be a single code (NZ) or a list (NZ,AU;JP).
       Also supports -l=..., --locale=..., --locales=...
+  -L, --list, --list-locales [LETTER]
+      Fetch RIR stats, list all available locale codes, and exit.
+      When LETTER (a single character) is given, only locales
+      beginning with that letter are listed (case insensitive).
+      A summary of matched vs total locales is printed to stderr.
+      Also supports --list=LETTER and --list-locales=LETTER.
   -m, --minimise-ipv6, --minimize-ipv6
       Minimise IPv6 formatting in output (RFC5952-style compression).
   -o, --output FILE
       Write output to file instead of stdout, use - for stdout.
+  -r, --refresh
+      Bypass the local RIR data cache and fetch fresh data.
+      Successful downloads still update the cache.
   -s, --self-test
       Perform local tests and exit.
   -v, --version
       Show version and exit.
+
 EOF
+
+}
+
+examples_text() {
+
+    cat <<EOF
+Examples:
+  # Positional locales
+  ./CIDRnt NZ
+  ./CIDRnt NZ AU
+  ./CIDRnt "NZ,AU,JP"
+
+  # Locale flags (-l/--locale, repeated or list)
+  ./CIDRnt -l NZ -l AU -l JP
+  ./CIDRnt --locale=NZ,AU,JP
+
+  # Custom entries (merged before final aggregation/sort)
+  ./CIDRnt NZ -c 203.0.113.7
+  ./CIDRnt --locale NZ --custom "203.0.113.0/24,2001:db8::/32"
+  ./CIDRnt -c=198.51.100.10 --custom=2001:db8::1 NZ
+
+  # Custom entries from a file (one IP/CIDR per line)
+  ./CIDRnt --custom ./custom-list.txt NZ
+  ./CIDRnt -c=./custom-list.txt NZ
+  ./CIDRnt --custom=./custom-list.txt NZ
+
+  # Mixed positional + locale flags
+  ./CIDRnt NZ --locale AU -l JP
+
+  # List locales
+  ./CIDRnt --list
+  ./CIDRnt --list-locales
+
+  # List locales starting with ...
+  ./CIDRnt --list A
+  ./CIDRnt --list-locales B
+
+  # Status/family filters
+  ./CIDRnt --allocated-only NZ AU
+  ./CIDRnt --ipv4-only --locale NZ --locale AU
+  ./CIDRnt --ipv6-only -l NZ -l AU
+
+  # IPv6 output minimisation
+  ./CIDRnt --minimise-ipv6 NZ
+
+  # Write output
+  ./CIDRnt -o ./out/nz.txt NZ
+  ./CIDRnt --output ./out/nz-au.txt NZ AU
+  ./CIDRnt --output=./out/nz-au-jp.txt --locale=NZ,AU,JP
+
+  # Force stdout explicitly
+  ./CIDRnt --output=- NZ
+EOF
+
+}
+
+help_text() {
+
+    usage_text
+
+    printf '\n'
+
+    examples_text
+
+}
+
+usage_error() {
+
+    printf 'error: %s\n\n' "$*" >&2
+
+    usage_text >&2
+
+    exit 2
 
 }
 
@@ -149,12 +247,12 @@ usage() {
 
     if [ ! -t 1 ]; then
 
-        usage_text
+        help_text
 
         return
     fi
 
-    lines=$(usage_text | awk 'END { print NR + 0 }')
+    lines=$(help_text | awk 'END { print NR + 0 }')
     rows=$(get_terminal_rows)
 
     if [ "$rows" -gt 0 ] && [ "$lines" -gt "$rows" ]; then
@@ -162,14 +260,14 @@ usage() {
 
         if [ -n "$pager_cmd" ]; then
 
-            usage_text | sh -c "$pager_cmd"
+            help_text | sh -c "$pager_cmd"
 
             return
         fi
 
     fi
 
-    usage_text
+    help_text
 
 }
 
@@ -185,7 +283,9 @@ need_cmd() {
 parse_locales() {
 
     if [ "$#" -eq 0 ]; then
-        set -- NZ
+
+        usage_error "at least one ISO-3166 alpha-2 locale is required"
+
     fi
 
     LOCALES_FILE="$TMPDIR/locales"
@@ -203,7 +303,7 @@ parse_locales() {
                     ;;
                 *)
 
-                    die "invalid locale code: $cc (expected ISO-3166 alpha-2)"
+                    usage_error "invalid locale code: $cc (expected ISO-3166 alpha-2)"
 
                     ;;
             esac
@@ -217,35 +317,113 @@ parse_locales() {
 
     mv "$LOCALES_FILE.tmp" "$LOCALES_FILE"
 
-    [ -s "$LOCALES_FILE" ] || die "no valid locales supplied"
+    [ -s "$LOCALES_FILE" ] || usage_error "no valid locales supplied"
 
 }
 
-can_use_cached_apnic() {
+provider_url() {
+
+    case "$1" in
+        afrinic)
+            printf '%s\n' "https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest"
+            ;;
+        apnic)
+            printf '%s\n' "https://ftp.apnic.net/stats/apnic/delegated-apnic-extended-latest"
+            ;;
+        arin)
+            printf '%s\n' "https://ftp.arin.net/pub/stats/arin/delegated-arin-extended-latest"
+            ;;
+        lacnic)
+            printf '%s\n' "https://ftp.lacnic.net/pub/stats/lacnic/delegated-lacnic-extended-latest"
+            ;;
+        ripencc)
+            printf '%s\n' "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest"
+            ;;
+        *)
+            die "unknown registry: $1"
+            ;;
+    esac
+
+}
+
+select_providers() {
+
+    awk -F'|' -v lf="$LOCALES_FILE" -v names="$RIR_NAMES" '
+        BEGIN {
+
+            while ((getline cc < lf) > 0) locales[cc] = 1
+
+            close(lf)
+
+            nall = split(names, all, " ")
+        }
+
+        /^[[:space:]]*#/ || NF < 2 { next }
+
+        {
+            cc = $1
+            gsub(/[[:space:]]/, "", cc)
+
+            if (!(cc in locales)) next
+
+            n = split($2, providers, /[,[:space:]]+/)
+
+            for (i = 1; i <= n; i++) {
+
+                if (providers[i] != "") selected[providers[i]] = 1
+
+            }
+
+            mapped[cc] = 1
+        }
+
+        END {
+
+            for (cc in locales) {
+
+                if (!(cc in mapped)) {
+
+                    for (i = 1; i <= nall; i++) selected[all[i]] = 1
+
+                    break
+                }
+
+            }
+
+            for (i = 1; i <= nall; i++) {
+
+                if (all[i] in selected) print all[i]
+
+            }
+
+        }
+
+    ' "$RIR_LOCALE_MAP"
+}
+
+can_use_cached_provider() {
+
+    provider=$1
+    cache_file="$CACHE_DIR/delegated-$provider-latest"
+    cache_stamp="$cache_file.epoch"
 
     case "$CACHE_TTL_SECONDS" in
-        ''|*[!0-9]*)
-            die "CACHE_TTL_SECONDS must be a non-negative integer"
-            ;;
+        ''|*[!0-9]*) die "CACHE_TTL_SECONDS must be a non-negative integer" ;;
     esac
 
     [ "$CACHE_TTL_SECONDS" -gt 0 ] || return 1
 
-    [ -s "$CACHE_FILE" ] || return 1
+    [ -s "$cache_file" ] || return 1
 
-    [ -s "$CACHE_STAMP" ] || return 1
+    [ -s "$cache_stamp" ] || return 1
 
     now=$(date +%s 2>/dev/null || printf '0')
-    fetched=$(cat "$CACHE_STAMP" 2>/dev/null || printf '0')
+    fetched=$(cat "$cache_stamp" 2>/dev/null || printf '0')
 
-    case "$now" in ''|*[!0-9]*)
-        return 1
-        ;;
-    esac
-
-    case "$fetched" in ''|*[!0-9]*)
-        return 1
-        ;;
+    case "$now:$fetched" in
+        *[!0-9:]*|:*|*:)
+            return 1
+            ;;
     esac
 
     age=$((now - fetched))
@@ -254,48 +432,34 @@ can_use_cached_apnic() {
 
 }
 
-fetch_apnic() {
+fetch_provider() {
+
+    provider=$1
+    url=$(provider_url "$provider")
+
+    [ -n "$url" ] || die "no download URL known for registry: $provider"
+
+    cache_file="$CACHE_DIR/delegated-$provider-latest"
+    cache_stamp="$cache_file.epoch"
+    data_file="$TMPDIR/delegated-$provider"
+    downloaded=0
 
     mkdir -p "$TMPDIR" "$CACHE_DIR"
 
-    if can_use_cached_apnic; then
+    if [ "$REFRESH_CACHE" -eq 0 ] && can_use_cached_provider "$provider"; then
 
-        cp "$CACHE_FILE" "$TMPDIR/delegated"
+        cp "$cache_file" "$data_file"
 
         return
     fi
 
     if need_cmd curl; then
 
-        curl -fsSL "$APNIC_URL" > "$TMPDIR/delegated" || {
-
-            if [ -s "$CACHE_FILE" ]; then
-                printf '%s\n' "warning: APNIC download failed, using cached data" >&2
-
-                cp "$CACHE_FILE" "$TMPDIR/delegated"
-
-                return
-            fi
-
-            die "failed fetching APNIC data with curl"
-
-        }
+        curl -fsSL "$url" > "$data_file" || true
 
     elif need_cmd wget; then
 
-        wget -q -O "$TMPDIR/delegated" "$APNIC_URL" || {
-
-            if [ -s "$CACHE_FILE" ]; then
-                printf '%s\n' "warning: APNIC download failed, using cached data" >&2
-
-                cp "$CACHE_FILE" "$TMPDIR/delegated"
-
-                return
-            fi
-
-            die "failed fetching APNIC data with wget"
-
-        }
+        wget -q -O "$data_file" "$url" || true
 
     else
 
@@ -303,16 +467,53 @@ fetch_apnic() {
 
     fi
 
-    cp "$TMPDIR/delegated" "$CACHE_FILE"
+    if [ -s "$data_file" ] && grep -q '|' "$data_file"; then
+        downloaded=1
+    fi
 
-    date +%s > "$CACHE_STAMP" 2>/dev/null || printf '0\n' > "$CACHE_STAMP"
+    if [ "$downloaded" -eq 1 ]; then
+
+        cp "$data_file" "$cache_file"
+
+        date +%s > "$cache_stamp" 2>/dev/null || printf '0\n' > "$cache_stamp"
+
+        return
+    fi
+
+    if [ -s "$cache_file" ]; then
+        printf 'warning: %s: download from %s failed, using cached data\n' "$provider" "$url" >&2
+
+        cp "$cache_file" "$data_file"
+
+        return
+    fi
+
+    die "failed fetching $provider data from $url"
+
+}
+
+fetch_providers() {
+
+    : > "$TMPDIR/delegated"
+
+    for provider do
+
+        fetch_provider "$provider"
+
+        cat "$TMPDIR/delegated-$provider" >> "$TMPDIR/delegated"
+
+    done
 
 }
 
 extract_cidrs() {
 
-    awk -F'|' -v lf="$LOCALES_FILE" -v status_mode="$STATUS_MODE" -v family_mode="$FAMILY_MODE" '
+    awk -F'|' -v lf="$LOCALES_FILE" -v status_mode="$STATUS_MODE" -v family_mode="$FAMILY_MODE" -v registry_names="$RIR_NAMES" '
         BEGIN {
+
+            split(registry_names, names, " ")
+
+            for (i in names) registries[names[i]] = 1
 
             while ((getline c < lf) > 0) cc[c] = 1
 
@@ -391,7 +592,7 @@ extract_cidrs() {
 
         }
 
-        $1 == "apnic" {
+        $1 in registries {
             status_ok = ($7 == "allocated" || (status_mode == "allocated-and-assigned" && $7 == "assigned"))
             locale_ok = ($2 in cc)
             family_ok = (family_mode == "all" || (family_mode == "ipv4" && $3 == "ipv4") || (family_mode == "ipv6" && $3 == "ipv6"))
@@ -411,13 +612,39 @@ extract_cidrs() {
             }
 
         }
+
     ' "$TMPDIR/delegated"
+
+}
+
+list_locales() {
+
+    awk -F'|' -v registry_names="$RIR_NAMES" -v filter="${1:-}" '
+        BEGIN {
+            split(registry_names, names, " ")
+
+            for (i in names) registries[names[i]] = 1
+
+            if (filter != "") filter = toupper(substr(filter, 1, 1))
+        }
+
+        $1 in registries && $2 != "" && $2 != "*" {
+
+            if (filter == "" || toupper(substr($2, 1, 1)) == filter) print $2
+        }
+
+    ' "$TMPDIR/delegated" | \
+
+        awk '!seen[$0]++' | \
+
+        sort
 
 }
 
 aggregate_with_awk() {
 
     awk '
+
         function dec_to_bin(n, w, s, i) {
             s = ""
 
@@ -477,7 +704,8 @@ aggregate_with_awk() {
         }
 
         function ipv4_to_bits(ip, a, i, o, bits) {
-            split(ip, a, ".")
+
+            if (split(ip, a, ".") != 4) return ""
 
             if (length(a) != 4) return ""
 
@@ -716,23 +944,10 @@ aggregate_with_awk() {
 
 }
 
-aggregate_cidrs() {
-
-    if need_cmd aggregate; then
-
-        aggregate
-
-    else
-
-        aggregate_with_awk
-
-    fi
-
-}
-
 sort_cidrs_natural() {
 
     awk '
+
         function dec_to_bin(n, w, s, i) {
             s = ""
 
@@ -967,6 +1182,7 @@ sort_cidrs_natural() {
             }
 
         }
+
     ' | sort -t'|' -k1,1n -k2,2 -k3,3n | awk -F'|' '{ print $4 }'
 
 }
@@ -974,6 +1190,7 @@ sort_cidrs_natural() {
 minimise_ipv6_cidrs() {
 
     awk '
+
         function trim_hextet(h) {
             sub(/^0+/, "", h)
             return (h == "" ? "0" : h)
@@ -1066,10 +1283,12 @@ generate_output() {
         extract_cidrs
 
         if [ -n "$CUSTOM_CIDRS_FILE" ] && [ -s "$CUSTOM_CIDRS_FILE" ]; then
+
             cat "$CUSTOM_CIDRS_FILE"
+
         fi
 
-    } | aggregate_cidrs | sort_cidrs_natural | {
+    } | aggregate_with_awk | sort_cidrs_natural | {
 
         if [ "$MINIMISE_IPV6" -eq 1 ]; then
 
@@ -1111,6 +1330,7 @@ parse_args() {
 
     ARGS_FILE="$TMPDIR/args"
     CUSTOM_ARGS_FILE="$TMPDIR/custom_args"
+
     : > "$ARGS_FILE"
     : > "$CUSTOM_ARGS_FILE"
 
@@ -1127,9 +1347,9 @@ parse_args() {
                 ;;
             -c|--custom)
 
-                [ "$#" -ge 2 ] || die "missing argument for $1"
+                [ "$#" -ge 2 ] || usage_error "missing argument for $1"
 
-                [ -n "$2" ] || die "missing argument for $1"
+                [ -n "$2" ] || usage_error "missing argument for $1"
 
                 printf '%s\n' "$2" >> "$CUSTOM_ARGS_FILE"
                 shift 2
@@ -1137,7 +1357,7 @@ parse_args() {
             -c=*|--custom=*)
                 custom_arg=${1#*=}
 
-                [ -n "$custom_arg" ] || die "missing argument for ${1%%=*}"
+                [ -n "$custom_arg" ] || usage_error "missing argument for ${1%%=*}"
 
                 printf '%s\n' "$custom_arg" >> "$CUSTOM_ARGS_FILE"
                 shift
@@ -1150,23 +1370,23 @@ parse_args() {
                 ;;
             -i|--ipv4-only)
 
-                [ "$FAMILY_MODE" = "all" ] || die "conflicting family options: --ipv4-only and --ipv6-only"
+                [ "$FAMILY_MODE" = "all" ] || usage_error "conflicting family options: --ipv4-only and --ipv6-only"
 
                 FAMILY_MODE="ipv4"
                 shift
                 ;;
             -I|--ipv6-only)
 
-                [ "$FAMILY_MODE" = "all" ] || die "conflicting family options: --ipv4-only and --ipv6-only"
+                [ "$FAMILY_MODE" = "all" ] || usage_error "conflicting family options: --ipv4-only and --ipv6-only"
 
                 FAMILY_MODE="ipv6"
                 shift
                 ;;
             -l|--locale|--locales)
 
-                [ "$#" -ge 2 ] || die "missing argument for $1"
+                [ "$#" -ge 2 ] || usage_error "missing argument for $1"
 
-                [ -n "$2" ] || die "missing argument for $1"
+                [ -n "$2" ] || usage_error "missing argument for $1"
 
                 printf '%s\n' "$2" >> "$ARGS_FILE"
                 shift 2
@@ -1174,9 +1394,40 @@ parse_args() {
             -l=*|--locale=*|--locales=*)
                 locale_arg=${1#*=}
 
-                [ -n "$locale_arg" ] || die "missing argument for ${1%%=*}"
+                [ -n "$locale_arg" ] || usage_error "missing argument for ${1%%=*}"
 
                 printf '%s\n' "$locale_arg" >> "$ARGS_FILE"
+                shift
+                ;;
+            -L|--list|--list-locales)
+                LIST_LOCALES=1
+                shift
+
+                case "${1:-}" in
+                    [A-Za-z])
+                        LIST_LOCALES_FILTER=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+                        shift
+                        ;;
+                esac
+
+                ;;
+            -L=*|--list=*|--list-locales=*)
+                LIST_LOCALES=1
+                LIST_LOCALES_FILTER=${1#*=}
+
+                case "$LIST_LOCALES_FILTER" in
+                    '')
+                        ;;
+                    [A-Za-z])
+                        LIST_LOCALES_FILTER=$(printf '%s' "$LIST_LOCALES_FILTER" | tr '[:lower:]' '[:upper:]')
+                        ;;
+                    *)
+
+                        usage_error "invalid locale filter: $LIST_LOCALES_FILTER (expected a single letter)"
+
+                        ;;
+                esac
+
                 shift
                 ;;
             -m|--minimise-ipv6|--minimize-ipv6)
@@ -1185,7 +1436,7 @@ parse_args() {
                 ;;
             -o|--output)
 
-                [ "$#" -ge 2 ] || die "missing argument for $1"
+                [ "$#" -ge 2 ] || usage_error "missing argument for $1"
 
                 OUTPUT_FILE=$2
                 shift 2
@@ -1193,8 +1444,12 @@ parse_args() {
             --output=*)
                 OUTPUT_FILE=${1#--output=}
 
-                [ -n "$OUTPUT_FILE" ] || die "missing argument for --output"
+                [ -n "$OUTPUT_FILE" ] || usage_error "missing argument for --output"
 
+                shift
+                ;;
+            -r|--refresh)
+                REFRESH_CACHE=1
                 shift
                 ;;
             -s|--self-test)
@@ -1202,7 +1457,7 @@ parse_args() {
                 shift
                 ;;
             -v|--version)
-                printf 'CIDRnt v%s\n' "$VERSION"
+                printf 'CIDRnt v%s\n' "$VERSION-$BRANCH"
                 exit 0
                 ;;
             --)
@@ -1216,7 +1471,9 @@ parse_args() {
                 break
                 ;;
             -*)
-                die "unknown option: $1"
+
+                usage_error "unknown option: $1"
+
                 ;;
             *)
                 printf '%s\n' "$1" >> "$ARGS_FILE"
@@ -1231,11 +1488,13 @@ parse_args() {
 prepare_custom_cidrs() {
 
     CUSTOM_CIDRS_FILE="$TMPDIR/custom.cidrs"
+
     : > "$CUSTOM_CIDRS_FILE"
 
     [ -s "$CUSTOM_ARGS_FILE" ] || return 0
 
     CUSTOM_EXPANDED_ARGS_FILE="$TMPDIR/custom.args.expanded"
+
     : > "$CUSTOM_EXPANDED_ARGS_FILE"
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1258,6 +1517,7 @@ prepare_custom_cidrs() {
     done < "$CUSTOM_ARGS_FILE"
 
     awk '
+
         function is_h16(x) { return (x ~ /^[0-9a-f]{1,4}$/) }
 
         function valid_ipv4(ip, a, i, o) {
@@ -1385,6 +1645,7 @@ prepare_custom_cidrs() {
             if (err) exit 1
 
         }
+
     ' "$CUSTOM_EXPANDED_ARGS_FILE" > "$TMPDIR/custom.cidrs.tmp" || die "failed parsing custom IP/CIDR input"
 
     awk '!seen[$0]++' "$TMPDIR/custom.cidrs.tmp" > "$CUSTOM_CIDRS_FILE"
@@ -1416,8 +1677,11 @@ self_test() {
         CUSTOM_ARGS_FILE=""
         CUSTOM_CIDRS_FILE=""
         FAMILY_MODE="all"
+        LIST_LOCALES=0
+        LIST_LOCALES_FILTER=""
         MINIMISE_IPV6=0
         OUTPUT_FILE=""
+        REFRESH_CACHE=0
         RUN_SELF_TEST=0
         STATUS_MODE="allocated-and-assigned"
     }
@@ -1501,13 +1765,33 @@ self_test() {
 
     }
 
+    self_test_assert_usage_error() {
+        label=$1
+        shift
+
+        rc=0
+
+        out=$( (parse_args "$@") 2>&1 ) || rc=$?
+
+        if [ "$rc" -eq 2 ] && printf '%s\n' "$out" | awk 'BEGIN{ok=0} /^Usage:/{ok=1} END{exit(ok?0:1)}'; then
+
+            self_test_pass "$label"
+
+        else
+
+            self_test_fail "$label" "exit=$rc" "$out"
+
+        fi
+
+    }
+
     self_test_assert_version() {
         label=$1
         shift
 
         if out=$( (parse_args "$@") 2>&1 ); then
 
-            self_test_assert_eq "$label" "$out" "CIDRnt v$VERSION" "version"
+            self_test_assert_eq "$label" "$out" "CIDRnt v$VERSION-$BRANCH" "version"
 
         else
 
@@ -1528,10 +1812,6 @@ self_test() {
     fail=0
 
     self_test_section "option parsing"
-
-    parse_locales NZ
-
-    self_test_parse_state "option parsing (-a)" STATUS_MODE "allocated-only" -a NZ
 
     self_test_parse_state "option parsing (--allocated-only)" STATUS_MODE "allocated-only" --allocated-only NZ
 
@@ -1608,6 +1888,18 @@ EOF
 
     fi
 
+    self_test_parse_state "option parsing (-L)" LIST_LOCALES "1" -L NZ
+
+    self_test_parse_state "option parsing (--list)" LIST_LOCALES "1" --list NZ
+
+    self_test_parse_state "option parsing (--list-locales)" LIST_LOCALES "1" --list-locales NZ
+
+    self_test_parse_state "option parsing (-L FILTER)" LIST_LOCALES_FILTER "N" -L n
+
+    self_test_parse_state "option parsing (--list=FILTER)" LIST_LOCALES_FILTER "A" --list=a
+
+    self_test_parse_state "option parsing (--list-locales=FILTER)" LIST_LOCALES_FILTER "Z" --list-locales=z
+
     self_test_parse_state "option parsing (-m)" MINIMISE_IPV6 "1" -m NZ
 
     self_test_parse_state "option parsing (--minimise-ipv6)" MINIMISE_IPV6 "1" --minimise-ipv6 NZ
@@ -1669,6 +1961,10 @@ EOF
 
     fi
 
+    self_test_parse_state "option parsing (-r)" REFRESH_CACHE "1" -r NZ
+
+    self_test_parse_state "option parsing (--refresh)" REFRESH_CACHE "1" --refresh NZ
+
     self_test_parse_state "option parsing (--self-test)" RUN_SELF_TEST "1" --self-test NZ
 
     self_test_assert_version "option parsing (-v)" -v
@@ -1699,7 +1995,247 @@ EOF
 
     fi
 
+    self_test_assert_usage_error "option parsing (unknown option is a usage error)" --bogus NZ
+
+    self_test_assert_usage_error "option parsing (missing -l argument is a usage error)" -l
+
+    self_test_assert_usage_error "option parsing (conflicting family options is a usage error)" -i -I NZ
+
+    self_test_assert_usage_error "option parsing (invalid locale filter is a usage error)" --list=12 NZ
+
+    self_test_section "provider selection"
+
+    saved_rir_locale_map=$RIR_LOCALE_MAP
+    RIR_LOCALE_MAP="$TMPDIR/test-rir-locales.map"
+
+    cat > "$RIR_LOCALE_MAP" <<'EOF'
+NZ|apnic
+AU|arin,ripencc
+EOF
+
+    parse_locales NZ
+
+    select_providers > "$TMPDIR/provider_selection_mapped.got"
+
+    printf '%s\n' apnic > "$TMPDIR/provider_selection_mapped.want"
+
+    self_test_diff \
+        "mapped locale selects its provider" \
+        "$TMPDIR/provider_selection_mapped.want" \
+        "$TMPDIR/provider_selection_mapped.got" || fail=1
+
+    parse_locales AU
+
+    select_providers > "$TMPDIR/provider_selection_multiple.got"
+
+    printf '%s\n' arin ripencc > "$TMPDIR/provider_selection_multiple.want"
+
+    self_test_diff \
+        "locale can select multiple providers" \
+        "$TMPDIR/provider_selection_multiple.want" \
+        "$TMPDIR/provider_selection_multiple.got" || fail=1
+
+    parse_locales ZZ
+
+    select_providers > "$TMPDIR/provider_selection_unmapped.got"
+
+    # shellcheck disable=SC2086
+    printf '%s\n' $RIR_NAMES > "$TMPDIR/provider_selection_unmapped.want"
+
+    self_test_diff \
+        "unmapped locale selects all providers" \
+        "$TMPDIR/provider_selection_unmapped.want" \
+        "$TMPDIR/provider_selection_unmapped.got" || fail=1
+
+    RIR_LOCALE_MAP=$saved_rir_locale_map
+
+    self_test_section "provider URLs"
+
+    for provider in $RIR_NAMES; do
+        provider_url_result=$(provider_url "$provider")
+
+        case "$provider_url_result" in
+            https://*)
+
+                self_test_pass "provider_url ($provider)"
+
+                ;;
+            *)
+
+                self_test_fail \
+                    "provider_url ($provider)" \
+                    "unexpected URL: $provider_url_result"
+
+                ;;
+        esac
+
+    done
+
+    self_test_section "provider fetching and cache"
+
+    saved_cache_dir=$CACHE_DIR
+    saved_cache_ttl=$CACHE_TTL_SECONDS
+    CACHE_DIR="$TMPDIR/test-cache"
+    CACHE_TTL_SECONDS=604800
+
+    mkdir -p "$CACHE_DIR"
+
+    printf '%s\n' "old cached data" > "$CACHE_DIR/delegated-apnic-latest"
+    printf '%s\n' 1 > "$CACHE_DIR/delegated-apnic-latest.epoch"
+
+    curl() {
+        return 22
+    }
+
+    fetch_provider apnic 2> "$TMPDIR/cache_fallback.warning"
+
+    unset -f curl
+
+    printf 'warning: apnic: download from %s failed, using cached data\n' "$(provider_url apnic)" > "$TMPDIR/cache_fallback_warning.want"
+
+    self_test_diff \
+        "failed download warns about cache fallback" \
+        "$TMPDIR/cache_fallback_warning.want" \
+        "$TMPDIR/cache_fallback.warning" || fail=1
+
+    printf '%s\n' "old cached data" > "$TMPDIR/cache_fallback.want"
+
+    self_test_diff \
+        "failed download uses cached data" \
+        "$TMPDIR/cache_fallback.want" \
+        "$TMPDIR/delegated-apnic" || fail=1
+
+    self_test_diff \
+        "failed download does not overwrite cache" \
+        "$TMPDIR/cache_fallback.want" \
+        "$CACHE_DIR/delegated-apnic-latest" || fail=1
+
+    cached_stamp=$(cat "$CACHE_DIR/delegated-apnic-latest.epoch")
+
+    self_test_assert_eq \
+        "failed download does not refresh cache timestamp" \
+        "$cached_stamp" \
+        "1" \
+        "cache timestamp"
+
+    date +%s > "$CACHE_DIR/delegated-apnic-latest.epoch"
+
+    rm -f "$TMPDIR/curl-called"
+
+    curl() {
+        : > "$TMPDIR/curl-called"
+        return 22
+    }
+
+    fetch_provider apnic
+
+    if [ -e "$TMPDIR/curl-called" ]; then
+
+        self_test_fail \
+            "fresh cache avoids network fetch" \
+            "curl was called despite a fresh cache"
+
+    else
+
+        self_test_pass "fresh cache avoids network fetch"
+
+    fi
+
+    REFRESH_CACHE=1
+
+    rm -f "$TMPDIR/curl-called"
+
+    fetch_provider apnic 2> "$TMPDIR/refresh_fallback.warning"
+
+    unset -f curl
+    REFRESH_CACHE=0
+
+    if [ -e "$TMPDIR/curl-called" ]; then
+
+        self_test_pass "--refresh bypasses fresh cache"
+
+    else
+
+        self_test_fail \
+            "--refresh bypasses fresh cache" \
+            "curl was not called despite --refresh"
+
+    fi
+
+    self_test_diff \
+        "--refresh warns about cache fallback" \
+        "$TMPDIR/cache_fallback_warning.want" \
+        "$TMPDIR/refresh_fallback.warning" || fail=1
+
+    self_test_diff \
+        "--refresh still falls back when download fails" \
+        "$TMPDIR/cache_fallback.want" \
+        "$TMPDIR/delegated-apnic" || fail=1
+
+    printf '%s\n' 1 > "$CACHE_DIR/delegated-apnic-latest.epoch"
+
+    curl() {
+        printf '%s\n' "apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated"
+    }
+
+    fetch_provider apnic
+
+    unset -f curl
+
+    cat > "$TMPDIR/cache_refresh.want" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+EOF
+
+    self_test_diff \
+        "successful download is used" \
+        "$TMPDIR/cache_refresh.want" \
+        "$TMPDIR/delegated-apnic" || fail=1
+
+    self_test_diff \
+        "successful download updates cache" \
+        "$TMPDIR/cache_refresh.want" \
+        "$CACHE_DIR/delegated-apnic-latest" || fail=1
+
+    refreshed_stamp=$(cat "$CACHE_DIR/delegated-apnic-latest.epoch")
+
+    if [ "$refreshed_stamp" != "1" ]; then
+
+        self_test_pass "successful download refreshes cache timestamp"
+
+    else
+
+        self_test_fail \
+            "successful download refreshes cache timestamp" \
+            "cache timestamp still $refreshed_stamp"
+
+    fi
+
+    rm -f "$CACHE_DIR/delegated-apnic-latest" "$CACHE_DIR/delegated-apnic-latest.epoch"
+
+    curl() {
+        return 22
+    }
+
+    if ( fetch_provider apnic ) 2>/dev/null; then
+
+        self_test_fail \
+            "failed download without cache is fatal" \
+            "fetch_provider unexpectedly succeeded"
+
+    else
+
+        self_test_pass "failed download without cache is fatal"
+
+    fi
+
+    unset -f curl
+
+    CACHE_DIR=$saved_cache_dir
+    CACHE_TTL_SECONDS=$saved_cache_ttl
+
     self_test_section "status and family filters"
+
+    parse_locales NZ
 
     self_test_reset_parse_state
 
@@ -1769,6 +2305,62 @@ EOF
         "ipv6-only filter" \
         "$TMPDIR/ipv6_only.want" \
         "$TMPDIR/ipv6_only.got" || fail=1
+
+    self_test_section "multiple registries"
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+arin|AU|ipv4|2.0.0.0|256|20200101|allocated
+EOF
+
+    parse_locales NZ AU
+    STATUS_MODE="allocated-only"
+    FAMILY_MODE="all"
+
+    extract_cidrs | sort > "$TMPDIR/multiple_registries.got"
+
+    cat > "$TMPDIR/multiple_registries.want" <<'EOF'
+1.0.0.0/24
+2.0.0.0/24
+EOF
+
+    self_test_diff \
+        "records from multiple registries" \
+        "$TMPDIR/multiple_registries.want" \
+        "$TMPDIR/multiple_registries.got" || fail=1
+
+    list_locales > "$TMPDIR/multiple_registry_locales.got"
+
+    cat > "$TMPDIR/multiple_registry_locales.want" <<'EOF'
+AU
+NZ
+EOF
+
+    self_test_diff \
+        "locales from multiple registries" \
+        "$TMPDIR/multiple_registry_locales.want" \
+        "$TMPDIR/multiple_registry_locales.got" || fail=1
+
+    self_test_section "locale listing"
+
+    cat > "$TMPDIR/delegated" <<'EOF'
+apnic|NZ|ipv4|1.0.0.0|256|20200101|allocated
+apnic|AU|ipv4|1.0.1.0|256|20200101|allocated
+apnic|NC|ipv4|1.0.2.0|256|20200101|allocated
+arin|US|ipv4|2.0.0.0|256|20200101|allocated
+EOF
+
+    list_locales n > "$TMPDIR/list_locales_filter.got"
+
+    cat > "$TMPDIR/list_locales_filter.want" <<'EOF'
+NC
+NZ
+EOF
+
+    self_test_diff \
+        "list locales filtered by leading letter (case insensitive)" \
+        "$TMPDIR/list_locales_filter.want" \
+        "$TMPDIR/list_locales_filter.got" || fail=1
 
     self_test_section "formatting and output"
 
@@ -1862,7 +2454,7 @@ EOF
 2001:0db8:0000:0000:0000:0000:0000:0000/32
 EOF
 
-    aggregate_cidrs < "$TMPDIR/aggregate_and_sort.in" | sort_cidrs_natural > "$TMPDIR/aggregate_and_sort.got"
+    aggregate_with_awk < "$TMPDIR/aggregate_and_sort.in" | sort_cidrs_natural > "$TMPDIR/aggregate_and_sort.got"
 
     self_test_diff \
         "aggregation pipeline" \
@@ -1910,6 +2502,36 @@ main() {
         exit $?
     fi
 
+    if [ "$LIST_LOCALES" -eq 1 ]; then
+
+        # shellcheck disable=SC2086
+        fetch_providers $RIR_NAMES
+
+        list_locales > "$TMPDIR/locale-list"
+
+        locale_total=$(awk 'END { print NR + 0 }' "$TMPDIR/locale-list")
+
+        if [ -n "$LIST_LOCALES_FILTER" ]; then
+
+            list_locales "$LIST_LOCALES_FILTER" > "$TMPDIR/locale-list.filtered"
+
+            locale_shown=$(awk 'END { print NR + 0 }' "$TMPDIR/locale-list.filtered")
+
+            cat "$TMPDIR/locale-list.filtered"
+
+            printf "locales beginning with '%s': %d of %d\n" "$LIST_LOCALES_FILTER" "$locale_shown" "$locale_total" >&2
+
+        else
+
+            cat "$TMPDIR/locale-list"
+
+            printf 'total locales: %d\n' "$locale_total" >&2
+
+        fi
+
+        exit 0
+    fi
+
     if [ -s "$ARGS_FILE" ]; then
         # shellcheck disable=SC2046
         set -- $(cat "$ARGS_FILE")
@@ -1921,7 +2543,12 @@ main() {
 
     prepare_custom_cidrs
 
-    fetch_apnic
+    providers=$(select_providers)
+
+    [ -n "$providers" ] || die "no RIR providers selected"
+
+    # shellcheck disable=SC2086
+    fetch_providers $providers
 
     write_output
 
